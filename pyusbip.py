@@ -487,7 +487,7 @@ class USBIPConnection:
 
         try:
             data = await self.reader.readexactly(2)
-        except asyncio.streams.IncompleteReadError:
+        except asyncio.exceptions.IncompleteReadError:
             return False
 
         (version,) = struct.unpack(">H", data)
