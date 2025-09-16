@@ -19,8 +19,9 @@
 
 import asyncio
 import dataclasses
+import logging
 import struct
-import traceback
+import sys
 
 from typing import Any
 
@@ -72,6 +73,14 @@ USB_REQ_SET_INTERFACE = 0x0B
 USB_ENOENT = 2
 USB_EPIPE = 32
 
+# Configure logging early
+logging.basicConfig(
+    level=logging.DEBUG if "-v" in sys.argv else logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("pyusbip")
+
 usbctx = usb1.USBContext()
 usbctx.open()
 
@@ -106,9 +115,11 @@ class USBIPConnection:
         self.devices = {}
         self.urbs = {}
 
-    def say(self, str):
-        addr = self.writer.get_extra_info("peername")
-        print(f"{addr}: {str}")
+        peer = writer.get_extra_info("peername")
+        if isinstance(peer, tuple) and len(peer) >= 2:
+            peer = f"{peer[0]}:{peer[1]}"
+        self.peer = str(peer)
+        self.logger = logging.getLogger(f"pyusbip.connection[{self.peer}]")
 
     def pack_device_desc(self, dev, interfaces=True):
         """Takes a usb1 device and packs it into a struct usb_device (and
@@ -205,7 +216,7 @@ class USBIPConnection:
             dev_busid = f"{dev.getBusNumber()}-{dev.getDeviceAddress()}"
             if busid == dev_busid:
                 hnd = dev.open()
-                self.say(f"opened device {busid}")
+                self.logger.info("opened device %s", busid)
                 devid = dev.getBusNumber() << 16 | dev.getDeviceAddress()
                 self.devices[devid] = USBIPDevice(devid, hnd)
                 resp = struct.pack(
@@ -218,7 +229,7 @@ class USBIPConnection:
                 self.writer.write(resp)
                 return
 
-        self.say("device not found")
+        self.logger.warning("device not found")
         resp = struct.pack(
             ">HHI", USBIP_VERSION, USBIP_OP_IMPORT | USBIP_REPLY, USBIP_ST_NA
         )
@@ -248,8 +259,12 @@ class USBIPConnection:
             "<BBHHH", setup
         )
 
-        self.say(
-            f"seq {seqnum:x}: ep {ep}, direction {direction}, {buflen} bytes"
+        self.logger.debug(
+            "seq %x: ep %d, direction %d, %d bytes",
+            seqnum,
+            ep,
+            direction,
+            buflen,
         )
 
         if ep == 0:
@@ -260,7 +275,9 @@ class USBIPConnection:
                     f"wLength {wLength} neq buflen {buflen}"
                 )
 
-            self.say(f"EP0 requesttype {bRequestType}, request {bRequest}")
+            self.logger.debug(
+                "EP0 requesttype %d, request %d", bRequestType, bRequest
+            )
 
             fakeit = False
 
@@ -273,7 +290,7 @@ class USBIPConnection:
                 bRequestType == USB_RECIP_DEVICE
                 and bRequest == USB_REQ_SET_CONFIGURATION
             ):
-                self.say(f"set configuration: {wValue}")
+                self.logger.info("set configuration: %d", wValue)
                 dev.hnd.setConfiguration(wValue)
 
                 # Claim all the interfaces.
@@ -283,7 +300,7 @@ class USBIPConnection:
                         config = _config
                         break
                 for i in range(config.getNumInterfaces()):
-                    self.say(f"  claim interface: {i}")
+                    self.logger.debug("  claim interface: %d", i)
                     dev.hnd.claimInterface(i)
 
                 fakeit = True
@@ -291,7 +308,9 @@ class USBIPConnection:
                 bRequestType == USB_RECIP_INTERFACE
                 and bRequest == USB_REQ_SET_INTERFACE
             ):
-                self.say(f"set interface alt setting: {wIndex} -> {wValue}")
+                self.logger.info(
+                    "set interface alt setting: %d -> %d", wIndex, wValue
+                )
                 dev.hnd.claimInterface(wIndex)
                 dev.hnd.setInterfaceAltSetting(wIndex, wValue)
                 fakeit = True
@@ -317,7 +336,9 @@ class USBIPConnection:
                         b"",
                     )
                     resp += data
-                    self.say(f"wrote response with {len(data)}/{wLength} bytes")
+                    self.logger.debug(
+                        "wrote response with %d/%d bytes", len(data), wLength
+                    )
                     self.writer.write(resp)
                 else:
                     if fakeit:
@@ -340,7 +361,7 @@ class USBIPConnection:
                         0,
                         b"",
                     )
-                    self.say(f"wrote {wlen}/{wLength} bytes")
+                    self.logger.debug("wrote %d/%d bytes", wlen, wLength)
                     self.writer.write(resp)
             except usb1.USBErrorPipe:
                 resp = struct.pack(
@@ -357,7 +378,7 @@ class USBIPConnection:
                     0,
                     b"",
                 )
-                self.say("EPIPE")
+                self.logger.warning("EPIPE during control transfer")
                 self.writer.write(resp)
         else:
             # Ok, a request on another endpoint.  These are asynchronous.
@@ -366,8 +387,12 @@ class USBIPConnection:
             if direction == USBIP_DIR_IN:
 
                 def callback(xfer_):
-                    self.say(
-                        f"callback IN seqnum {seqnum:x} status {xfer.getStatus()} len {xfer.getActualLength()} buflen {len(xfer.getBuffer())}"
+                    self.logger.debug(
+                        "callback IN seqnum %x status %d len %d buflen %d",
+                        seqnum,
+                        xfer.getStatus(),
+                        xfer.getActualLength(),
+                        len(xfer.getBuffer()),
                     )
                     resp = struct.pack(
                         ">IIIIIiiiii8s",
@@ -393,8 +418,10 @@ class USBIPConnection:
             else:
 
                 def callback(xfer_):
-                    self.say(
-                        f"callback OUT seqnum {seqnum:x} status {xfer.getStatus()} "
+                    self.logger.debug(
+                        "callback OUT seqnum %x status %d",
+                        seqnum,
+                        xfer.getStatus(),
                     )
                     resp = struct.pack(
                         ">IIIIIiiiii8s",
@@ -424,7 +451,7 @@ class USBIPConnection:
             struct.unpack(op_submit, data)
         )
 
-        self.say(f"seq {sseqnum:x}: UNLINK")
+        self.logger.debug("seq %x: UNLINK", sseqnum)
 
         if sseqnum not in self.urbs:
             rv = -USB_ENOENT
@@ -503,7 +530,7 @@ class USBIPConnection:
                 raise USBIPUnimplementedException("DEVINFO")
                 # writer.write(struct.pack(">HHI", version, USBIP_OP_DEVINFO | USBIP_REPLY, USBIP_ST_NA)
             elif opcode == USBIP_OP_DEVLIST | USBIP_REQUEST:
-                self.say("DEVLIST")
+                self.logger.debug("DEVLIST")
                 # XXX: in theory, op_devlist_request has a _reserved, but they don't seem to xmit it?
                 # data = await self.reader.readexactly(4) # reserved
                 self.handle_op_devlist()
@@ -513,7 +540,7 @@ class USBIPConnection:
                     .decode()
                     .rstrip("\0")
                 )
-                self.say(f"IMPORT {data}")
+                self.logger.debug("IMPORT %s", data)
                 self.handle_op_import(data)
             else:
                 raise USBIPProtocolErrorException(f"bad USBIP op {opcode:x}")
@@ -525,7 +552,7 @@ class USBIPConnection:
         return True
 
     async def connection(self):
-        self.say("connect")
+        self.logger.info("connect")
 
         while True:
             try:
@@ -533,12 +560,11 @@ class USBIPConnection:
                 await self.writer.drain()
                 if not success:
                     break
-            except Exception as e:
-                traceback.print_exc()
-                self.say("force disconnect due to exception")
+            except Exception:
+                self.logger.exception("force disconnect due to exception")
                 break
 
-        self.say("disconnect")
+        self.logger.info("disconnect")
         for i in self.devices:
             self.devices[i].hnd.close()
             self.devices[i] = None
@@ -561,12 +587,12 @@ def usb_callback():
 
 
 def usb_added(fd, events):
-    print(f"adding fd {fd} for {events}")
+    logger.debug("adding fd %s for %s", fd, events)
     loop.add_reader(fd, usb_callback)
 
 
 def usb_removed(fd, events):
-    print(f"removing fd {fd} for {events}")
+    logger.debug("removing fd %s for %s", fd, events)
     loop.remove_reader(fd)
 
 
@@ -574,13 +600,13 @@ for fd, events in usbctx.getPollFDList():
     usb_added(fd, events)
 usbctx.setPollFDNotifiers(usb_added, usb_removed)
 
-print(f"Serving on {server.sockets[0].getsockname()}")
+logger.info("Serving on %s", server.sockets[0].getsockname())
 try:
     loop.run_forever()
 except KeyboardInterrupt:
     pass
 
-print("Shutting down...")
+logger.info("Shutting down...")
 server.close()
 loop.run_until_complete(server.wait_closed())
 loop.close()
