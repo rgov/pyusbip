@@ -476,7 +476,25 @@ class USBIPConnection:
 
         self.writer.write(resp)
 
-    def handle_op_import(self, busid: str) -> None:
+    def handle_op_devinfo(self) -> None:
+        # Read bus ID string
+        busid = (
+            (await self.reader.readexactly(USBIP_BUS_ID_SIZE))
+            .decode()
+            .rstrip("\0")
+        )
+        self.logger.debug("DEVINFO %s", busid)
+        raise USBIPUnimplementedException("DEVINFO")
+
+    def handle_op_import(self) -> None:
+        # Read bus ID string
+        busid = (
+            (await self.reader.readexactly(USBIP_BUS_ID_SIZE))
+            .decode()
+            .rstrip("\0")
+        )
+        self.logger.debug("IMPORT %s", busid)
+
         # We kind of do this the hard way -- rather than looking up by bus
         # id / device address, we instead just compare the string.  Life is
         # too short to extend python-libusb1.
@@ -503,6 +521,16 @@ class USBIPConnection:
             ">HHI", USBIP_VERSION, USBIP_OP_IMPORT | USBIP_REPLY, USBIP_ST_NA
         )
         self.writer.write(resp)
+
+    async def handle_op_unspec(self) -> None:
+        self.writer.write(
+            struct.pack(
+                ">HHI",
+                USBIP_VERSION,
+                USBIP_OP_UNSPEC | USBIP_REPLY,
+                USBIP_ST_OK,
+            )
+        )
 
     async def handle_urb_submit(
         self, seqnum: int, dev: USBIPDevice, direction: int, ep: int
@@ -610,79 +638,71 @@ class USBIPConnection:
 
         self.writer.write(self.pack_ret_unlink(seqnum, rv))
 
-    async def handle_packet(self):
-        """
-        Handle a USBIP packet.
-        """
+    async def handle_urb_packet(self, prefix: int) -> None:
+        """Parse and handle a URB-family packet."""
+        op_common = ">HIIII"
+        data = await self.reader.readexactly(struct.calcsize(op_common))
+        (opcode, seqnum, devid, direction, ep) = struct.unpack(op_common, data)
+        opcode |= prefix << 16  # restore prefix we already consumed
 
-        # Try to read a header of some kind.  We can tell because if it's an
-        # URB, the |op_common.version| is overlayed with the
-        # |usbip_header_basic.command|, and so the |.version| is 0x0000;
-        # otherwise, it's supposed to be 0x0106.
+        if devid not in self.devices:
+            raise USBIPProtocolErrorException(f"devid unattached {devid:x}")
+        dev = self.devices[devid]
+
+        urb_handlers = {
+            USBIP_CMD_SUBMIT: self.handle_urb_submit,
+            USBIP_CMD_UNLINK: self.handle_urb_unlink,
+            USBIP_RESET_DEV: None,  # TODO: implement
+        }
+
+        handler = urb_handlers.get(opcode)
+        if handler is None:
+            if opcode == USBIP_RESET_DEV:
+                raise USBIPUnimplementedException("URB_RESET_DEV")
+            raise USBIPProtocolErrorException(f"bad USBIP URB {opcode:x}")
+
+        await handler(seqnum, dev, direction, ep)
+
+    async def handle_control_packet(self, version: int) -> None:
+        """Parse and handle a control-family packet."""
+        op_common = ">HI"
+        data = await self.reader.readexactly(struct.calcsize(op_common))
+        (opcode, _status) = struct.unpack(op_common, data)
+
+        handlers = {
+            (USBIP_OP_UNSPEC | USBIP_REQUEST): self.handle_op_unspec,
+            (USBIP_OP_DEVINFO | USBIP_REQUEST): self.handle_op_devinfo,
+            (USBIP_OP_DEVLIST | USBIP_REQUEST): self.handle_op_devlist,
+            (USBIP_OP_IMPORT | USBIP_REQUEST): self.handle_op_import,
+        }
+
+        handler = handlers.get(opcode)
+        if handler is not None:
+            await handler()
+            return
+
+        raise USBIPProtocolErrorException(f"bad USBIP op {opcode:x}")
+
+    async def handle_packet(self):
+        """Decode one packet and dispatch to the appropriate handler."""
 
         try:
             data = await self.reader.readexactly(2)
         except asyncio.IncompleteReadError:
             return False
 
-        (version,) = struct.unpack(">H", data)
-        if version == 0x0000:
-            # Note that we've already trimmed the version.
-            op_common = ">HIIII"
-            data = await self.reader.readexactly(struct.calcsize(op_common))
-            (opcode, seqnum, devid, direction, ep) = struct.unpack(
-                op_common, data
-            )
+        # We use the first 16 bits to determine whether this is a URB packet
+        # sent with a usbip_header_basic, or a protocol-level control packet
+        # where the first field is the protocol version.
+        (prefix,) = struct.unpack(">H", data)
 
-            if devid not in self.devices:
-                raise USBIPProtocolErrorException(f"devid unattached {devid:x}")
-            dev = self.devices[devid]
-
-            if opcode == USBIP_CMD_SUBMIT:
-                await self.handle_urb_submit(seqnum, dev, direction, ep)
-            elif opcode == USBIP_CMD_UNLINK:
-                await self.handle_urb_unlink(seqnum, dev, direction, ep)
-            elif opcode == USBIP_RESET_DEV:
-                raise USBIPUnimplementedException("URB_RESET_DEV")
-            else:
-                raise USBIPProtocolErrorException(f"bad USBIP URB {opcode:x}")
-        elif (version & 0xFF00) == 0x0100:
-            # Note that we've already trimmed the version.
-            op_common = ">HI"
-            data = await self.reader.readexactly(struct.calcsize(op_common))
-            (opcode, status) = struct.unpack(op_common, data)
-
-            if opcode == USBIP_OP_UNSPEC | USBIP_REQUEST:
-                self.writer.write(
-                    struct.pack(
-                        ">HHI",
-                        version,
-                        USBIP_OP_UNSPEC | USBIP_REPLY,
-                        USBIP_ST_OK,
-                    )
-                )
-            elif opcode == USBIP_OP_DEVINFO | USBIP_REQUEST:
-                data = await self.reader.readexactly(USBIP_BUS_ID_SIZE)
-                raise USBIPUnimplementedException("DEVINFO")
-                # writer.write(struct.pack(">HHI", version, USBIP_OP_DEVINFO | USBIP_REPLY, USBIP_ST_NA)
-            elif opcode == USBIP_OP_DEVLIST | USBIP_REQUEST:
-                self.logger.debug("DEVLIST")
-                # XXX: in theory, op_devlist_request has a _reserved, but they don't seem to xmit it?
-                # data = await self.reader.readexactly(4) # reserved
-                self.handle_op_devlist()
-            elif opcode == USBIP_OP_IMPORT | USBIP_REQUEST:
-                data = (
-                    (await self.reader.readexactly(USBIP_BUS_ID_SIZE))
-                    .decode()
-                    .rstrip("\0")
-                )
-                self.logger.debug("IMPORT %s", data)
-                self.handle_op_import(data)
-            else:
-                raise USBIPProtocolErrorException(f"bad USBIP op {opcode:x}")
+        if prefix == 0x0000:
+            await self.handle_urb_packet()
+        elif (prefix & 0xFF00) == 0x0100:
+            await self.handle_control_packet(prefix)
         else:
             raise USBIPProtocolErrorException(
-                f"unsupported USBIP version {version:02x}"
+                f"Unexpected start to packet: {prefix:02x}"
             )
 
         return True
