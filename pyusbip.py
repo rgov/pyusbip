@@ -68,6 +68,12 @@ USB_REQ_SET_ADDRESS = 0x05
 USB_REQ_SET_CONFIGURATION = 0x09
 USB_REQ_SET_INTERFACE = 0x0B
 
+USB_ENDPOINT_XFERTYPE_MASK = 0x03
+USB_ENDPOINT_XFER_CONTROL = 0
+USB_ENDPOINT_XFER_ISOC = 1
+USB_ENDPOINT_XFER_BULK = 2
+USB_ENDPOINT_XFER_INT = 3
+
 USB_ENOENT = 2
 USB_EPIPE = 32
 
@@ -97,6 +103,8 @@ class USBIPProtocolErrorException(Exception):
 class USBIPDevice:
     devid: int
     hnd: usb1.USBDeviceHandle
+    endpoint_types: dict[int, int] = dataclasses.field(default_factory=dict)
+    alt_settings: dict[int, int] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -120,6 +128,64 @@ class USBIPConnection:
             peer = f"{peer[0]}:{peer[1]}"
         self.peer = str(peer)
         self.logger = logging.getLogger(f"pyusbip.connection[{self.peer}]")
+
+    def rebuild_endpoint_map(self, dev: USBIPDevice) -> None:
+        """Rebuild endpoint->transfer-type map for the active configuration.
+
+        Uses dev.alt_settings (defaulting to 0 per interface) to select the
+        active alternate setting when enumerating endpoints.
+        """
+        try:
+            cfg_val = dev.hnd.getConfiguration()
+        except Exception:
+            # Fallback to first configuration if querying fails
+            cfg_val = next(dev.hnd.getDevice().iterConfigurations()).getConfigurationValue()
+
+        cfg = None
+        for _cfg in dev.hnd.getDevice().iterConfigurations():
+            if _cfg.getConfigurationValue() == cfg_val:
+                cfg = _cfg
+                break
+        if cfg is None:
+            return
+
+        new_map: dict[int, int] = {}
+        type_name = {
+            USB_ENDPOINT_XFER_CONTROL: "CTRL",
+            USB_ENDPOINT_XFER_ISOC: "ISOC",
+            USB_ENDPOINT_XFER_BULK: "BULK",
+            USB_ENDPOINT_XFER_INT: "INT",
+        }
+        for i, ifc in enumerate(cfg.iterInterfaces()):
+            # Choose desired alt setting if available, else first
+            target_alt = dev.alt_settings.get(i, 0)
+            chosen = None
+            for setting in ifc:
+                if setting.getAlternateSetting() == target_alt:
+                    chosen = setting
+                    break
+            if chosen is None:
+                chosen = list(ifc)[0]
+                dev.alt_settings[i] = chosen.getAlternateSetting()
+            else:
+                dev.alt_settings.setdefault(i, target_alt)
+
+            ep_summaries = []
+            for epd in chosen.iterEndpoints():
+                addr = epd.getAddress()
+                xfertype = epd.getAttributes() & USB_ENDPOINT_XFERTYPE_MASK
+                new_map[addr] = xfertype
+                ep_summaries.append(
+                    f"0x{addr:02x} {type_name.get(xfertype, str(xfertype))}"
+                )
+            self.logger.debug(
+                "iface %d alt %d: %s",
+                i,
+                dev.alt_settings.get(i, 0),
+                ", ".join(ep_summaries),
+            )
+
+        dev.endpoint_types = new_map
 
     def pack_device_desc(
         self, dev: usb1.USBDevice, interfaces: bool = True
@@ -220,7 +286,8 @@ class USBIPConnection:
                 hnd = dev.open()
                 self.logger.info("opened device %s", busid)
                 devid = dev.getBusNumber() << 16 | dev.getDeviceAddress()
-                self.devices[devid] = USBIPDevice(devid, hnd)
+                self.devices[devid] = USBIPDevice(devid=devid, hnd=hnd)
+                self.rebuild_endpoint_map(self.devices[devid])
                 resp = struct.pack(
                     ">HHI",
                     USBIP_VERSION,
@@ -308,6 +375,10 @@ class USBIPConnection:
                     self.logger.debug("  claim interface: %d", i)
                     dev.hnd.claimInterface(i)
 
+                # Reset alt settings and rebuild endpoint map for the new config
+                dev.alt_settings = {}
+                self.rebuild_endpoint_map(dev)
+
                 fakeit = True
             elif (
                 bRequestType == USB_RECIP_INTERFACE
@@ -318,6 +389,9 @@ class USBIPConnection:
                 )
                 dev.hnd.claimInterface(wIndex)
                 dev.hnd.setInterfaceAltSetting(wIndex, wValue)
+                # Update stored alt setting and rebuild endpoint map for current config
+                dev.alt_settings[wIndex] = wValue
+                self.rebuild_endpoint_map(dev)
                 fakeit = True
 
             try:
@@ -417,7 +491,13 @@ class USBIPConnection:
                     self.writer.write(resp)
                     del self.urbs[seqnum]
 
-                xfer.setBulk(ep | 0x80, buflen, callback)
+                # Choose transfer type based on endpoint descriptor
+                addr_in = (ep & 0x0F) | 0x80
+                xfertype = dev.endpoint_types.get(addr_in)
+                if xfertype == USB_ENDPOINT_XFER_INT:
+                    xfer.setInterrupt(addr_in, buflen, callback)
+                else:
+                    xfer.setBulk(addr_in, buflen, callback)
                 xfer.submit()
                 self.urbs[seqnum] = USBIPPending(seqnum, dev, xfer)
             else:
@@ -445,7 +525,14 @@ class USBIPConnection:
                     self.writer.write(resp)
                     del self.urbs[seqnum]
 
-                xfer.setBulk(ep, buf, callback)
+                # Choose transfer type based on endpoint descriptor
+                # Endpoint address: low 4 bits = number
+                addr_out = ep & 0x0F
+                xfertype = dev.endpoint_types.get(addr_out)
+                if xfertype == USB_ENDPOINT_XFER_INT:
+                    xfer.setInterrupt(addr_out, buf, callback)
+                else:
+                    xfer.setBulk(addr_out, buf, callback)
                 xfer.submit()
                 self.urbs[seqnum] = USBIPPending(seqnum, dev, xfer)
 
