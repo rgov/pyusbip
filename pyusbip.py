@@ -18,8 +18,11 @@
 # limitations under the License.
 
 import asyncio
+import dataclasses
 import struct
 import traceback
+
+from typing import Any
 
 import usb1
 
@@ -83,17 +86,17 @@ class USBIPProtocolErrorException(Exception):
         self.message = message
 
 
+@dataclasses.dataclass
 class USBIPDevice:
-    def __init__(self, devid, hnd):
-        self.devid = devid
-        self.hnd = hnd
+    devid: int
+    hnd: Any
 
 
+@dataclasses.dataclass
 class USBIPPending:
-    def __init__(self, seqnum, device, xfer):
-        self.seqnum = seqnum
-        self.device = device
-        self.xfer = xfer
+    seqnum: int
+    device: USBIPDevice
+    xfer: Any
 
 
 class USBIPConnection:
