@@ -198,6 +198,121 @@ class USBIPConnection:
 
         dev.endpoint_types = new_map
 
+    @staticmethod
+    def ep_addr(ep: int, direction: int) -> int:
+        return (ep & 0x0F) | ((1 if direction else 0) << 7)
+
+    @staticmethod
+    def pack_ret_submit(
+        seqnum: int, status: int, actual_len: int, data: bytes = b""
+    ) -> bytes:
+        hdr = struct.pack(
+            ">IIIIIiiiii8s",
+            USBIP_RET_SUBMIT,
+            seqnum,
+            0,
+            0,
+            0,
+            status,
+            actual_len,
+            0,
+            0,
+            0,
+            b"",
+        )
+        return hdr + (data or b"")
+
+    @staticmethod
+    def pack_ret_unlink(seqnum: int, rv: int) -> bytes:
+        return struct.pack(
+            ">IIIIIiiiii8s",
+            USBIP_RET_UNLINK,
+            seqnum,
+            0,
+            0,
+            0,
+            rv,
+            0,
+            0,
+            0,
+            0,
+            b"",
+        )
+
+    def claim_and_rebuild(self, dev: USBIPDevice, cfg_value: int) -> None:
+        # Claim all interfaces for the specified configuration and rebuild maps
+        config = None
+        for _config in dev.hnd.getDevice().iterConfigurations():
+            if _config.getConfigurationValue() == cfg_value:
+                config = _config
+                break
+        if config is None:
+            return
+        for i in range(config.getNumInterfaces()):
+            self.logger.debug("  claim interface: %d", i)
+            dev.hnd.claimInterface(i)
+        dev.alt_settings = {}
+        self.rebuild_endpoint_map(dev)
+
+    def handle_control_transfer(
+        self,
+        dev: USBIPDevice,
+        setup: bytes,
+        direction: int,
+        out_buf: bytes,
+    ) -> tuple[int, int, bytes]:
+        # Returns (status, actual_len, data)
+        (bRequestType, bRequest, wValue, wIndex, wLength) = struct.unpack(
+            "<BBHHH", setup
+        )
+
+        self.logger.debug(
+            "EP0 requesttype %d, request %d", bRequestType, bRequest
+        )
+
+        fakeit = False
+
+        if bRequestType == USB_RECIP_DEVICE and bRequest == USB_REQ_SET_ADDRESS:
+            raise USBIPUnimplementedException("USB_REQ_SET_ADDRESS")
+        elif (
+            bRequestType == USB_RECIP_DEVICE
+            and bRequest == USB_REQ_SET_CONFIGURATION
+        ):
+            self.logger.info("set configuration: %d", wValue)
+            dev.hnd.setConfiguration(wValue)
+            self.claim_and_rebuild(dev, wValue)
+            fakeit = True
+        elif (
+            bRequestType == USB_RECIP_INTERFACE
+            and bRequest == USB_REQ_SET_INTERFACE
+        ):
+            self.logger.info(
+                "set interface alt setting: %d -> %d", wIndex, wValue
+            )
+            dev.hnd.claimInterface(wIndex)
+            dev.hnd.setInterfaceAltSetting(wIndex, wValue)
+            dev.alt_settings[wIndex] = wValue
+            self.rebuild_endpoint_map(dev)
+            fakeit = True
+
+        try:
+            if direction == USBIP_DIR_IN:
+                data = dev.hnd.controlRead(
+                    bRequestType, bRequest, wValue, wIndex, wLength
+                )
+                return (0, len(data), data)
+            else:
+                if fakeit:
+                    wlen = 0
+                else:
+                    wlen = dev.hnd.controlWrite(
+                        bRequestType, bRequest, wValue, wIndex, out_buf
+                    )
+                return (0, wlen, b"")
+        except usb1.USBErrorPipe:
+            self.logger.warning("EPIPE during control transfer")
+            return (-USB_EPIPE, 0, b"")
+
     def claim_device(
         self, dev: usb1.USBDevice, hnd: usb1.USBDeviceHandle
     ) -> USBIPDevice:
@@ -408,13 +523,9 @@ class USBIPConnection:
                 f"ISO number_of_packets {number_of_packets}"
             )
 
-        buf = b""
+        out_buf = b""
         if direction == USBIP_DIR_OUT:
-            buf = await self.reader.readexactly(buflen)
-
-        (bRequestType, bRequest, wValue, wIndex, wLength) = struct.unpack(
-            "<BBHHH", setup
-        )
+            out_buf = await self.reader.readexactly(buflen)
 
         self.logger.debug(
             "seq %x: ep %d, direction %d, %d bytes",
@@ -425,201 +536,60 @@ class USBIPConnection:
         )
 
         if ep == 0:
-            # EP0 control traffic; unpack the control request.  We deal with
-            # this synchronously.
-            if wLength != buflen:
-                raise USBIPProtocolErrorException(
-                    f"wLength {wLength} neq buflen {buflen}"
-                )
-
-            self.logger.debug(
-                "EP0 requesttype %d, request %d", bRequestType, bRequest
+            # EP0 control traffic; handle synchronously via helper
+            (status, actual_len, data_bytes) = self.handle_control_transfer(
+                dev, setup, direction, out_buf
             )
-
-            fakeit = False
-
             if (
-                bRequestType == USB_RECIP_DEVICE
-                and bRequest == USB_REQ_SET_ADDRESS
+                direction == USBIP_DIR_IN
+                and actual_len != struct.unpack("<BBHHH", setup)[4]
             ):
-                raise USBIPUnimplementedException("USB_REQ_SET_ADDRESS")
-            elif (
-                bRequestType == USB_RECIP_DEVICE
-                and bRequest == USB_REQ_SET_CONFIGURATION
-            ):
-                self.logger.info("set configuration: %d", wValue)
-                dev.hnd.setConfiguration(wValue)
-
-                # Claim all the interfaces.
-                config = None
-                for _config in dev.hnd.getDevice().iterConfigurations():
-                    if _config.getConfigurationValue() == wValue:
-                        config = _config
-                        break
-                for i in range(config.getNumInterfaces()):
-                    self.logger.debug("  claim interface: %d", i)
-                    dev.hnd.claimInterface(i)
-
-                # Reset alt settings and rebuild endpoint map for the new config
-                dev.alt_settings = {}
-                self.rebuild_endpoint_map(dev)
-
-                fakeit = True
-            elif (
-                bRequestType == USB_RECIP_INTERFACE
-                and bRequest == USB_REQ_SET_INTERFACE
-            ):
-                self.logger.info(
-                    "set interface alt setting: %d -> %d", wIndex, wValue
+                self.logger.debug(
+                    "wrote response with %d/%d bytes",
+                    actual_len,
+                    struct.unpack("<BBHHH", setup)[4],
                 )
-                dev.hnd.claimInterface(wIndex)
-                dev.hnd.setInterfaceAltSetting(wIndex, wValue)
-                # Update stored alt setting and rebuild endpoint map for current config
-                dev.alt_settings[wIndex] = wValue
-                self.rebuild_endpoint_map(dev)
-                fakeit = True
+            resp = self.pack_ret_submit(seqnum, status, actual_len, data_bytes)
+            self.writer.write(resp)
+            return
 
-            try:
-                if direction == USBIP_DIR_IN:
-                    data = dev.hnd.controlRead(
-                        bRequestType, bRequest, wValue, wIndex, wLength
-                    )
-                    resp = struct.pack(
-                        ">IIIIIiiiii8s",
-                        USBIP_RET_SUBMIT,
-                        seqnum,
-                        0,
-                        0,
-                        0,
-                        # dev.devid, direction, ep,
-                        0,
-                        len(data),
-                        0,
-                        0,
-                        0,
-                        b"",
-                    )
-                    resp += data
-                    self.logger.debug(
-                        "wrote response with %d/%d bytes", len(data), wLength
-                    )
-                    self.writer.write(resp)
-                else:
-                    if fakeit:
-                        wlen = 0
-                    else:
-                        wlen = dev.hnd.controlWrite(
-                            bRequestType, bRequest, wValue, wIndex, buf
-                        )
-                    resp = struct.pack(
-                        ">IIIIIiiiii8s",
-                        USBIP_RET_SUBMIT,
-                        seqnum,
-                        0,
-                        0,
-                        0,
-                        0,
-                        wlen,
-                        0,
-                        0,
-                        0,
-                        b"",
-                    )
-                    self.logger.debug("wrote %d/%d bytes", wlen, wLength)
-                    self.writer.write(resp)
-            except usb1.USBErrorPipe:
-                resp = struct.pack(
-                    ">IIIIIiiiii8s",
-                    USBIP_RET_SUBMIT,
-                    seqnum,
-                    0,
-                    0,
-                    0,
-                    -USB_EPIPE,
-                    0,
-                    0,
-                    0,
-                    0,
-                    b"",
-                )
-                self.logger.warning("EPIPE during control transfer")
-                self.writer.write(resp)
-        else:
-            # Ok, a request on another endpoint.  These are asynchronous.
-            xfer = dev.hnd.getTransfer()
+        # Non-EP0 endpoints: asynchronous path unified
+        xfer = dev.hnd.getTransfer()
 
+        def done_callback(xfer_):
+            status = xfer.getStatus()
+            actual = xfer.getActualLength()
+            self.logger.debug(
+                "callback seqnum %x status %d len %d",
+                seqnum,
+                status,
+                actual,
+            )
+            data = b""
             if direction == USBIP_DIR_IN:
+                data = xfer.getBuffer()[:actual]
+            self.writer.write(
+                self.pack_ret_submit(seqnum, -status, actual, data)
+            )
+            del self.urbs[seqnum]
 
-                def callback(xfer_):
-                    self.logger.debug(
-                        "callback IN seqnum %x status %d len %d buflen %d",
-                        seqnum,
-                        xfer.getStatus(),
-                        xfer.getActualLength(),
-                        len(xfer.getBuffer()),
-                    )
-                    resp = struct.pack(
-                        ">IIIIIiiiii8s",
-                        USBIP_RET_SUBMIT,
-                        seqnum,
-                        0,
-                        0,
-                        0,
-                        -xfer.getStatus(),
-                        xfer.getActualLength(),
-                        0,
-                        0,
-                        0,
-                        b"",
-                    )
-                    resp += xfer.getBuffer()[: xfer.getActualLength()]
-                    self.writer.write(resp)
-                    del self.urbs[seqnum]
-
-                # Choose transfer type based on endpoint descriptor
-                addr_in = (ep & 0x0F) | 0x80
-                xfertype = dev.endpoint_types.get(addr_in)
-                if xfertype == USB_ENDPOINT_XFER_INT:
-                    xfer.setInterrupt(addr_in, buflen, callback)
-                else:
-                    xfer.setBulk(addr_in, buflen, callback)
-                xfer.submit()
-                self.urbs[seqnum] = USBIPPending(seqnum, dev, xfer)
-            else:
-
-                def callback(xfer_):
-                    self.logger.debug(
-                        "callback OUT seqnum %x status %d",
-                        seqnum,
-                        xfer.getStatus(),
-                    )
-                    resp = struct.pack(
-                        ">IIIIIiiiii8s",
-                        USBIP_RET_SUBMIT,
-                        seqnum,
-                        0,
-                        0,
-                        0,
-                        -xfer.getStatus(),
-                        xfer.getActualLength(),
-                        0,
-                        0,
-                        0,
-                        b"",
-                    )
-                    self.writer.write(resp)
-                    del self.urbs[seqnum]
-
-                # Choose transfer type based on endpoint descriptor
-                # Endpoint address: low 4 bits = number
-                addr_out = ep & 0x0F
-                xfertype = dev.endpoint_types.get(addr_out)
-                if xfertype == USB_ENDPOINT_XFER_INT:
-                    xfer.setInterrupt(addr_out, buf, callback)
-                else:
-                    xfer.setBulk(addr_out, buf, callback)
-                xfer.submit()
-                self.urbs[seqnum] = USBIPPending(seqnum, dev, xfer)
+        # Choose transfer type based on endpoint descriptor
+        addr = self.ep_addr(ep, direction)
+        xfertype = dev.endpoint_types.get(addr)
+        if xfertype == USB_ENDPOINT_XFER_INT:
+            xfer.setInterrupt(
+                addr,
+                buflen if direction == USBIP_DIR_IN else out_buf,
+                done_callback,
+            )
+        else:
+            xfer.setBulk(
+                addr,
+                buflen if direction == USBIP_DIR_IN else out_buf,
+                done_callback,
+            )
+        xfer.submit()
+        self.urbs[seqnum] = USBIPPending(seqnum, dev, xfer)
 
     async def handle_urb_unlink(
         self, seqnum: int, dev: USBIPDevice, direction: int, ep: int
@@ -638,21 +608,7 @@ class USBIPConnection:
             rv = 0
             self.urbs[sseqnum].xfer.cancel()
 
-        resp = struct.pack(
-            ">IIIIIiiiii8s",
-            USBIP_RET_UNLINK,
-            seqnum,
-            0,
-            0,
-            0,
-            rv,
-            0,
-            0,
-            0,
-            0,
-            b"",
-        )
-        self.writer.write(resp)
+        self.writer.write(self.pack_ret_unlink(seqnum, rv))
 
     async def handle_packet(self):
         """
@@ -761,7 +717,7 @@ class USBIPConnection:
                         self.logger.debug("resetDevice error: %s", e)
             finally:
                 dev.hnd.close()
-                self.devices[devid] = None
+                del self.devices[devid]
         await self.writer.drain()
         self.writer.close()
 
