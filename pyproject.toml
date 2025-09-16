@@ -1,0 +1,9 @@
+[project]
+name = "pyusbip"
+version = "0.1.0"
+description = "USBIP server in Python"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "libusb1>=3.3.1",
+]
