@@ -622,7 +622,7 @@ class USBIPConnection:
 
         try:
             data = await self.reader.readexactly(2)
-        except asyncio.exceptions.IncompleteReadError:
+        except asyncio.IncompleteReadError:
             return False
 
         (version,) = struct.unpack(">H", data)
@@ -720,43 +720,55 @@ class USBIPConnection:
                 del self.devices[devid]
         await self.writer.drain()
         self.writer.close()
+        await self.writer.wait_closed()
 
 
-async def usbip_connection(reader, writer):
-    conn = USBIPConnection(reader, writer)
-    await conn.connection()
+def setup_libusb_event_sources():
+    loop = asyncio.get_running_loop()
+
+    def on_pollfd_added(fd, events):
+        logger.debug("Adding libusb pollfd %d", fd)
+        loop.add_reader(fd, usbctx.handleEventsTimeout)
+
+    def on_pollfd_removed(fd, events):
+        logger.debug("Removing libusb pollfd %d", fd)
+        loop.remove_reader(fd)
+
+    # Handle any existing fds
+    for fd, events in usbctx.getPollFDList():
+        on_pollfd_added(fd, events)
+
+    # Register for future changes
+    usbctx.setPollFDNotifiers(on_pollfd_added, on_pollfd_removed)
 
 
-loop = asyncio.get_event_loop()
-coro = asyncio.start_server(usbip_connection, USBIP_HOST, USBIP_PORT, loop=loop)
-server = loop.run_until_complete(coro)
+async def main():
+    setup_libusb_event_sources()
+
+    async def on_usbip_connection(reader, writer):
+        conn = USBIPConnection(reader, writer)
+        await conn.connection()
+
+    server = await asyncio.start_server(
+        on_usbip_connection, USBIP_HOST, USBIP_PORT
+    )
+
+    addr = server.sockets[0].getsockname()
+    logger.info("Serving on %s", addr)
+
+    try:
+        async with server:
+            await server.serve_forever()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        logger.info("Shutting down...")
+        server.close()
+        await server.wait_closed()
 
 
-def usb_callback():
-    usbctx.handleEventsTimeout()
-
-
-def usb_added(fd, events):
-    logger.debug("adding fd %s for %s", fd, events)
-    loop.add_reader(fd, usb_callback)
-
-
-def usb_removed(fd, events):
-    logger.debug("removing fd %s for %s", fd, events)
-    loop.remove_reader(fd)
-
-
-for fd, events in usbctx.getPollFDList():
-    usb_added(fd, events)
-usbctx.setPollFDNotifiers(usb_added, usb_removed)
-
-logger.info("Serving on %s", server.sockets[0].getsockname())
-try:
-    loop.run_forever()
-except KeyboardInterrupt:
-    pass
-
-logger.info("Shutting down...")
-server.close()
-loop.run_until_complete(server.wait_closed())
-loop.close()
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
