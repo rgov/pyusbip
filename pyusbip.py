@@ -139,11 +139,18 @@ class USBIPConnection:
         """
         try:
             cfg_val = dev.hnd.getConfiguration()
-        except Exception:
+        except usb1.USBError as e:
             # Fallback to first configuration if querying fails
-            cfg_val = next(
-                dev.hnd.getDevice().iterConfigurations()
-            ).getConfigurationValue()
+            self.logger.debug("getConfiguration failed: %s", e)
+            try:
+                cfg_val = next(
+                    dev.hnd.getDevice().iterConfigurations()
+                ).getConfigurationValue()
+            except StopIteration:
+                self.logger.debug(
+                    "no configurations available while rebuilding map"
+                )
+                return
 
         cfg = None
         for _cfg in dev.hnd.getDevice().iterConfigurations():
@@ -204,8 +211,13 @@ class USBIPConnection:
         # Determine active configuration
         try:
             cfg_val = hnd.getConfiguration()
-        except Exception:
-            cfg_val = next(dev.iterConfigurations()).getConfigurationValue()
+        except usb1.USBError as e:
+            self.logger.debug("getConfiguration failed during claim: %s", e)
+            try:
+                cfg_val = next(dev.iterConfigurations()).getConfigurationValue()
+            except StopIteration:
+                self.logger.debug("no configurations available during claim")
+                cfg_val = 0
 
         detached_any = False
         for cfg in dev.iterConfigurations():
@@ -215,11 +227,15 @@ class USBIPConnection:
                 # Use first setting to get interface number
                 try:
                     ifn = list(ifc)[0].getNumber()
-                except Exception:
+                except (IndexError, TypeError, AttributeError) as e:
+                    self.logger.debug("failed to get interface number: %s", e)
                     continue
                 try:
                     active = hnd.kernelDriverActive(ifn)
-                except Exception:
+                except usb1.USBError as e:
+                    self.logger.debug(
+                        "kernelDriverActive failed on if %d: %s", ifn, e
+                    )
                     active = False
                 if active:
                     self.logger.warning(
@@ -239,12 +255,12 @@ class USBIPConnection:
                             self.logger.info(
                                 "detached kernel driver on interface %d", ifn
                             )
-                        except Exception as e:
-                            self.logger.error(
-                                "failed to detach kernel driver on interface %d: %s",
+                        except usb1.USBError as e:
+                            self.logger.warning(
+                                "failed to detach kernel driver on interface %d",
                                 ifn,
-                                e,
                             )
+                            self.logger.debug("detachKernelDriver error: %s", e)
 
         devid = dev.getBusNumber() << 16 | dev.getDeviceAddress()
         usbip_dev = USBIPDevice(
@@ -284,7 +300,10 @@ class USBIPConnection:
             hnd = dev.open()
             bConfigurationValue = hnd.getConfiguration()
             hnd.close()
-        except Exception:
+        except usb1.USBError as e:
+            self.logger.debug(
+                "pack_device_desc: getConfiguration via open failed: %s", e
+            )
             bConfigurationValue = configs[0].getConfigurationValue()
         bNumConfigurations = dev.getNumConfigurations()
 
@@ -735,10 +754,11 @@ class USBIPConnection:
                             devid,
                         )
                         dev.hnd.resetDevice()
-                    except Exception as e:
+                    except usb1.USBError as e:
                         self.logger.warning(
-                            "device reset failed for 0x%08x: %s", devid, e
+                            "device reset failed for 0x%08x", devid
                         )
+                        self.logger.debug("resetDevice error: %s", e)
             finally:
                 dev.hnd.close()
                 self.devices[devid] = None
