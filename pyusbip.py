@@ -23,8 +23,6 @@ import logging
 import struct
 import sys
 
-from typing import Any
-
 import usb1
 
 
@@ -86,34 +84,36 @@ usbctx.open()
 
 
 class USBIPUnimplementedException(Exception):
-    def __init__(self, message):
+    def __init__(self, message: str) -> None:
         self.message = message
 
 
 class USBIPProtocolErrorException(Exception):
-    def __init__(self, message):
+    def __init__(self, message: str) -> None:
         self.message = message
 
 
 @dataclasses.dataclass
 class USBIPDevice:
     devid: int
-    hnd: Any
+    hnd: usb1.USBDeviceHandle
 
 
 @dataclasses.dataclass
 class USBIPPending:
     seqnum: int
     device: USBIPDevice
-    xfer: Any
+    xfer: usb1.USBTransfer
 
 
 class USBIPConnection:
-    def __init__(self, reader, writer):
+    def __init__(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         self.reader = reader
         self.writer = writer
-        self.devices = {}
-        self.urbs = {}
+        self.devices: dict[int, USBIPDevice] = {}
+        self.urbs: dict[int, USBIPPending] = {}
 
         peer = writer.get_extra_info("peername")
         if isinstance(peer, tuple) and len(peer) >= 2:
@@ -121,7 +121,9 @@ class USBIPConnection:
         self.peer = str(peer)
         self.logger = logging.getLogger(f"pyusbip.connection[{self.peer}]")
 
-    def pack_device_desc(self, dev, interfaces=True):
+    def pack_device_desc(
+        self, dev: usb1.USBDevice, interfaces: bool = True
+    ) -> bytes:
         """Takes a usb1 device and packs it into a struct usb_device (and
         optionally, struct usb_interfaces)."""
 
@@ -192,7 +194,7 @@ class USBIPConnection:
 
         return data
 
-    def handle_op_devlist(self):
+    def handle_op_devlist(self) -> None:
         devlist = usbctx.getDeviceList()
 
         resp = struct.pack(
@@ -207,7 +209,7 @@ class USBIPConnection:
 
         self.writer.write(resp)
 
-    def handle_op_import(self, busid):
+    def handle_op_import(self, busid: str) -> None:
         # We kind of do this the hard way -- rather than looking up by bus
         # id / device address, we instead just compare the string.  Life is
         # too short to extend python-libusb1.
@@ -235,7 +237,9 @@ class USBIPConnection:
         )
         self.writer.write(resp)
 
-    async def handle_urb_submit(self, seqnum, dev, direction, ep):
+    async def handle_urb_submit(
+        self, seqnum: int, dev: USBIPDevice, direction: int, ep: int
+    ) -> None:
         op_submit = ">Iiiii8s"
         data = await self.reader.readexactly(struct.calcsize(op_submit))
         (
@@ -252,6 +256,7 @@ class USBIPConnection:
                 f"ISO number_of_packets {number_of_packets}"
             )
 
+        buf = b""
         if direction == USBIP_DIR_OUT:
             buf = await self.reader.readexactly(buflen)
 
@@ -444,7 +449,9 @@ class USBIPConnection:
                 xfer.submit()
                 self.urbs[seqnum] = USBIPPending(seqnum, dev, xfer)
 
-    async def handle_urb_unlink(self, seqnum, dev, direction, ep):
+    async def handle_urb_unlink(
+        self, seqnum: int, dev: USBIPDevice, direction: int, ep: int
+    ) -> None:
         op_submit = ">Iiiii8s"
         data = await self.reader.readexactly(struct.calcsize(op_submit))
         (sseqnum, buflen, start_frame, number_of_packets, interval, setup) = (
