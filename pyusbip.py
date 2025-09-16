@@ -473,6 +473,7 @@ class USBIPConnection:
             0,
             b"",
         )
+        self.writer.write(resp)
 
     async def handle_packet(self):
         """
