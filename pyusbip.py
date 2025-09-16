@@ -22,6 +22,7 @@ import dataclasses
 import logging
 import struct
 import sys
+import os
 
 import usb1
 
@@ -105,6 +106,7 @@ class USBIPDevice:
     hnd: usb1.USBDeviceHandle
     endpoint_types: dict[int, int] = dataclasses.field(default_factory=dict)
     alt_settings: dict[int, int] = dataclasses.field(default_factory=dict)
+    detached_kernel: bool = False
 
 
 @dataclasses.dataclass
@@ -139,7 +141,9 @@ class USBIPConnection:
             cfg_val = dev.hnd.getConfiguration()
         except Exception:
             # Fallback to first configuration if querying fails
-            cfg_val = next(dev.hnd.getDevice().iterConfigurations()).getConfigurationValue()
+            cfg_val = next(
+                dev.hnd.getDevice().iterConfigurations()
+            ).getConfigurationValue()
 
         cfg = None
         for _cfg in dev.hnd.getDevice().iterConfigurations():
@@ -186,6 +190,69 @@ class USBIPConnection:
             )
 
         dev.endpoint_types = new_map
+
+    def claim_device(
+        self, dev: usb1.USBDevice, hnd: usb1.USBDeviceHandle
+    ) -> USBIPDevice:
+        """Detach kernel drivers if needed and prepare the USBIPDevice.
+
+        - Checks each interface in the active configuration for a kernel driver
+          and detaches if running as root.
+        - Builds the endpoint map and initializes alt settings.
+        - Returns a populated USBIPDevice instance.
+        """
+        # Determine active configuration
+        try:
+            cfg_val = hnd.getConfiguration()
+        except Exception:
+            cfg_val = next(dev.iterConfigurations()).getConfigurationValue()
+
+        detached_any = False
+        for cfg in dev.iterConfigurations():
+            if cfg.getConfigurationValue() != cfg_val:
+                continue
+            for ifc in cfg.iterInterfaces():
+                # Use first setting to get interface number
+                try:
+                    ifn = list(ifc)[0].getNumber()
+                except Exception:
+                    continue
+                try:
+                    active = hnd.kernelDriverActive(ifn)
+                except Exception:
+                    active = False
+                if active:
+                    self.logger.warning(
+                        "kernel driver active on interface %d", ifn
+                    )
+                    # On macOS, detaching typically requires root; on Linux, attempt regardless
+                    is_macos = sys.platform.startswith("darwin")
+                    if is_macos and os.geteuid() != 0:
+                        self.logger.info(
+                            "macOS non-root; not detaching kernel driver on interface %d",
+                            ifn,
+                        )
+                    else:
+                        try:
+                            hnd.detachKernelDriver(ifn)
+                            detached_any = True
+                            self.logger.info(
+                                "detached kernel driver on interface %d", ifn
+                            )
+                        except Exception as e:
+                            self.logger.error(
+                                "failed to detach kernel driver on interface %d: %s",
+                                ifn,
+                                e,
+                            )
+
+        devid = dev.getBusNumber() << 16 | dev.getDeviceAddress()
+        usbip_dev = USBIPDevice(
+            devid=devid, hnd=hnd, detached_kernel=detached_any
+        )
+        # Build initial endpoint map
+        self.rebuild_endpoint_map(usbip_dev)
+        return usbip_dev
 
     def pack_device_desc(
         self, dev: usb1.USBDevice, interfaces: bool = True
@@ -285,9 +352,8 @@ class USBIPConnection:
             if busid == dev_busid:
                 hnd = dev.open()
                 self.logger.info("opened device %s", busid)
-                devid = dev.getBusNumber() << 16 | dev.getDeviceAddress()
-                self.devices[devid] = USBIPDevice(devid=devid, hnd=hnd)
-                self.rebuild_endpoint_map(self.devices[devid])
+                claimed = self.claim_device(dev, hnd)
+                self.devices[claimed.devid] = claimed
                 resp = struct.pack(
                     ">HHI",
                     USBIP_VERSION,
@@ -660,9 +726,22 @@ class USBIPConnection:
                 break
 
         self.logger.info("disconnect")
-        for i in self.devices:
-            self.devices[i].hnd.close()
-            self.devices[i] = None
+        for devid, dev in list(self.devices.items()):
+            try:
+                if dev and dev.detached_kernel:
+                    try:
+                        self.logger.info(
+                            "resetting device 0x%08x due to prior kernel detach",
+                            devid,
+                        )
+                        dev.hnd.resetDevice()
+                    except Exception as e:
+                        self.logger.warning(
+                            "device reset failed for 0x%08x: %s", devid, e
+                        )
+            finally:
+                dev.hnd.close()
+                self.devices[devid] = None
         await self.writer.drain()
         self.writer.close()
 
